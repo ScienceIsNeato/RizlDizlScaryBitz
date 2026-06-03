@@ -1,4 +1,5 @@
 import Cocoa
+import IOKit.hidsystem
 
 /// Monitors global key events and reports them through `onKeyPress`.
 /// Uses both CGEvent tap and NSEvent global monitor for maximum compatibility.
@@ -39,6 +40,7 @@ public final class KeyboardMonitor {
     private var eventTap: CFMachPort?
     private var tapThread: Thread?
     private var globalMonitor: Any?
+    private var rearmTimer: Timer?
 
     /// Invoked on every mapped key press with (row, col, optional A–Z glyph).
     /// The host app wires this to its effect engine; this library never stores
@@ -59,6 +61,19 @@ public final class KeyboardMonitor {
         return AXIsProcessTrustedWithOptions([key: false] as CFDictionary)
     }
 
+    /// Whether Input Monitoring is granted — this is what the CGEvent tap (the
+    /// primary capture path) actually needs.
+    public var hasInputMonitoringPermission: Bool {
+        IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+    }
+
+    /// Surfaces the system Input Monitoring prompt on first run (no-op once the
+    /// user has already allowed or denied). Lets new users grant up front instead
+    /// of hitting a silent capture failure.
+    public func requestPermissions() {
+        _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+    }
+
     /// Whether key events are actually being received (set after first event)
     public var receivingEvents: Bool {
         lock.lock()
@@ -73,7 +88,12 @@ public final class KeyboardMonitor {
             return true
         }
 
-        NSLog("RizlDizl: starting keyboard monitor, accessibility=%d", hasAccessibilityPermission ? 1 : 0)
+        // First run: surface the Input Monitoring prompt so the user can grant
+        // up front rather than hitting a silent failure.
+        requestPermissions()
+
+        NSLog("RizlDizl: starting keyboard monitor, accessibility=%d inputMonitoring=%d",
+              hasAccessibilityPermission ? 1 : 0, hasInputMonitoringPermission ? 1 : 0)
 
         // Strategy 1: CGEvent tap on a dedicated thread
         let tapStarted = startEventTap()
@@ -82,10 +102,38 @@ public final class KeyboardMonitor {
         let monitorStarted = startGlobalMonitor()
 
         NSLog("RizlDizl: eventTap=%d, globalMonitor=%d", tapStarted ? 1 : 0, monitorStarted ? 1 : 0)
+
+        // If the tap couldn't arm yet (permission not granted at launch), watch
+        // for the grant and arm it live — no app relaunch required.
+        startRearmWatchdog()
+
         return tapStarted || monitorStarted
     }
 
+    // MARK: - Permission re-arm watchdog
+
+    /// Polls for Input Monitoring being granted after launch and arms the key tap
+    /// the moment it is, so granting permission never requires a manual relaunch.
+    /// Scheduled on the caller's run loop — `start()` is called on the main thread
+    /// (menu-bar app), which has a live run loop.
+    private func startRearmWatchdog() {
+        rearmTimer?.invalidate()
+        rearmTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            guard self.eventTap == nil else { return } // already armed
+            if self.hasInputMonitoringPermission {
+                NSLog("RizlDizl: Input Monitoring granted post-launch — arming key tap live")
+                if self.startEventTap() {
+                    timer.invalidate()
+                    self.rearmTimer = nil
+                }
+            }
+        }
+    }
+
     public func stop() {
+        rearmTimer?.invalidate()
+        rearmTimer = nil
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
